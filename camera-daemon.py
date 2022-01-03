@@ -64,6 +64,11 @@ try:
 except (NoOptionError, NoSectionError):
     TITLE = 'pi-camera'
 
+try:
+    FAVICON_FILE = parser.get('general', 'favicon_file')
+except (NoOptionError, NoSectionError):
+    FAVICON_FILE = None
+
 PAGE = """<html>
     <head>
         <title>{title}</title>
@@ -108,7 +113,6 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_response(301)
             self.send_header('Location', '/index.html')
             self.end_headers()
-
         elif self.path == '/index.html':
             content = PAGE.encode('utf-8')
             self.send_response(200)
@@ -116,7 +120,14 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
-
+        elif FAVICON_FILE and self.path == '/favicon.ico':
+            with open(FAVICON_FILE, 'rb') as reader:
+                content = reader.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', len(content))
+                self.end_headers()
+                self.wfile.write(content) 
         elif self.path == '/stream.mjpg':
             self.send_response(200)
             self.send_header('Age', 0)
