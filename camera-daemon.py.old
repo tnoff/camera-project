@@ -1,0 +1,181 @@
+from configparser import NoSectionError, NoOptionError, SafeConfigParser
+from datetime import datetime
+from logging import Formatter, getLogger, StreamHandler, DEBUG
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from statistics import mean
+from time import sleep
+
+import click
+from picamera import PiCamera
+from gpiozero import MotionSensor
+
+def read_settings_file(settings_file):
+    path = Path(settings_file)
+    if not path.exists():
+        return {}
+
+    parser = SafeConfigParser()
+    parser.read(str(path))
+
+    return_dict = {}
+    config_options = {
+        'log_file': {
+            'path' : ['general', 'log_file'],
+            'default': None,
+            'type': 'path'
+        },
+        'output_dir': {
+            'path': ['general', 'media_save_dir'],
+            'default': None,
+            'type': 'path',
+        },
+        'picture_interval': {
+            'path': ['general', 'picture_interval_seconds'],
+            'default': 300,
+            'type': 'integer',
+        },
+        'min_video_length': {
+            'path': ['general', 'min_video_seconds'],
+            'default': 10,
+            'type': 'integer',
+        },
+        'max_video_length': {
+            'path': ['general', 'max_video_seconds'],
+            'default': 300,
+            'type': 'integer',
+        },
+        'sensor_queue_length': {
+            'path': ['sensor', 'queue_length'],
+            'default': 1,
+            'type': 'integer', 
+        },
+        'sensor_sample_rate': {
+            'path': ['sensor', 'sample_rate'],
+            'default': 10,
+            'type': 'integer',
+        },
+        'sensor_threshold': {
+            'path': ['sensor', 'threshold'],
+            'default': .5,
+            'type': 'float',
+        },
+        'camera_resolution': {
+            'path': ['camera', 'resolution'],
+            'default': '1296x972',
+            'type': 'string',
+        },
+        'camera_framerate': {
+            'path': ['camera', 'framerate'],
+            'default': 12,
+            'type': 'integer',
+        }
+    }
+    for key, value in config_options.items():
+        try:
+            return_dict[key] = parser.get(*value['path'])
+        except (NoOptionError, NoSectionError):
+            return_dict[key] = value['default']
+            continue
+        if value['type'] == 'path':
+            return_dict[key] = Path(return_dict[key])
+        elif value['type'] == 'integer':
+            return_dict[key] = int(return_dict[key])
+        elif value['type'] == 'float':
+            return_dict[key] = float(return_dict[key])
+    return return_dict
+
+def main_loop(logger, camera, pir, settings, video_dir, picture_dir):
+    last_pic_taken = datetime.now()
+    video_started = None
+    cooldown_started = False
+    values_list = []
+    while True:
+        sleep(1)
+        now = datetime.now()
+
+        if pir.motion_detected and not video_started:
+            # Take a picture at the start, just so we have something quicker
+            output_file_path = picture_dir / f'{datetime.now().strftime("%Y-%m-%d-%H-%M-%S.%f")}.jpg'
+            camera.capture(str(output_file_path))
+            logger.info(f'Picture taken at {str(output_file_path)}')
+            latest_symlink_path = picture_dir / 'latest.jpg'
+            if latest_symlink_path.exists():
+                latest_symlink_path.unlink()
+            latest_symlink_path.symlink_to(output_file_path)
+            # Then start video
+            output_file_path = video_dir / f'{datetime.now().strftime("%Y-%m-%d-%H-%M-%S.%f")}.h264'
+            camera.start_recording(str(output_file_path))
+            logger.info(f'Motion detected, starting capture at file {str(output_file_path)}')
+            video_started = now
+        elif not pir.motion_detected and video_started:
+            if not cooldown_started:
+                logger.debug('No motion detected, starting cooldown time')
+                cooldown_started = True
+                sleep(settings['min_video_length'] - (now - video_started).seconds)
+            else:
+                cooldown_started = False
+                camera.stop_recording()
+                logger.info('No more motion deteteced, stopping recording')
+                video_started = None
+                last_pic_taken = now
+        # Check we haven't hit video limit
+        elif video_started and (now - video_started).seconds > settings['max_video_length']:
+            camera.stop_recording()
+            logger.info('Reached maximum video time, stopping recording')
+            video_started = None
+            last_pic_taken = now
+        # If no video or pic in the last interval, take a pic so we have a recent one
+        elif (now - last_pic_taken).seconds > settings['picture_interval']:
+            output_file_path = picture_dir / f'{datetime.now().strftime("%Y-%m-%d-%H-%M-%S.%f")}.jpg'
+            camera.capture(str(output_file_path))
+            logger.info(f'Picture taken at {str(output_file_path)}')
+            last_pic_taken = now
+            latest_symlink_path = picture_dir / 'latest.jpg'
+            if latest_symlink_path.exists():
+                latest_symlink_path.unlink()
+            latest_symlink_path.symlink_to(output_file_path)
+
+@click.command()
+@click.option('--settings-file', '-s', default='/etc/pi-camera.conf')
+def main(settings_file):
+    settings = read_settings_file(settings_file)
+
+    logger = getLogger(__name__)
+    logger.setLevel(DEBUG)
+    frmt = Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    if settings['log_file']:
+        settings['log_file'].parent.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(str(settings['log_file']), backupCount=3, maxBytes=(2 ** 20) * 10)
+        fh.setLevel(DEBUG)
+        fh.setFormatter(frmt)
+        logger.addHandler(fh)
+
+    sh = StreamHandler()
+    sh.setLevel(DEBUG)
+    sh.setFormatter(frmt)
+    logger.addHandler(sh)
+
+    if settings['output_dir']:
+        output_dir_path = Path(settings['output_dir'])
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+    else:
+        raise Exception('No input dir given')
+
+    video_dir = output_dir_path / 'videos'
+    video_dir.mkdir(parents=True, exist_ok=True)
+    picture_dir = output_dir_path / 'pictures'
+    picture_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f'Starting up motion sensor and camera with settings {settings}')
+
+    pir = MotionSensor(4,
+                       queue_len=settings['sensor_queue_length'],
+                       sample_rate=settings['sensor_sample_rate'],
+                       threshold=settings['sensor_threshold'])
+    with PiCamera(resolution=settings['camera_resolution'],
+                  framerate=settings['camera_framerate']) as camera:
+        main_loop(logger, camera, pir, settings, video_dir, picture_dir)
+ 
+
+if __name__ == '__main__':
+    main()
